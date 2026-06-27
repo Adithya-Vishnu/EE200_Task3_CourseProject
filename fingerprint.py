@@ -46,7 +46,7 @@ HASH_TIME_QUANTIZE = 0.5     # Quantize time difference to 0.5 second bins
 # PHASE 1: AUDIO LOADING AND DFT ANALYSIS
 # ============================================================================
 
-def load_audio(song_path):
+def load_audio(song_path, max_duration=None):
     """
     Load audio file using librosa.
     
@@ -54,6 +54,8 @@ def load_audio(song_path):
     ----------
     song_path : str
         Path to audio file (mp3, wav, etc.)
+    max_duration : float, optional
+        Load at most this many seconds. ``None`` loads the complete file.
     
     Returns
     -------
@@ -64,7 +66,7 @@ def load_audio(song_path):
     duration : float
         Duration in seconds
     """
-    y, sr = librosa.load(song_path, sr=SAMPLE_RATE)
+    y, sr = librosa.load(song_path, sr=SAMPLE_RATE, duration=max_duration)
     duration = librosa.get_duration(y=y, sr=sr)
     return y, sr, duration
 

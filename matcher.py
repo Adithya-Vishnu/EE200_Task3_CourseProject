@@ -14,7 +14,9 @@ offset histogram. Wrong songs produce scattered random offsets.
 
 import numpy as np
 import matplotlib.pyplot as plt
+from collections import Counter
 from pathlib import Path
+from time import perf_counter
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -43,8 +45,8 @@ class SongMatcher:
         self.single_peak_db = database.single_peak_db
         self.song_list = database.song_list
     
-    def match_query(self, query_path, use_single_peaks=False, 
-                    confidence_threshold=40):
+    def match_query(self, query_path, use_single_peaks=False,
+                    confidence_threshold=40, max_duration=30):
         """
         Identify a song from a query clip.
         
@@ -73,59 +75,79 @@ class SongMatcher:
             }
         """
         
-        # Load and fingerprint query
-        y, sr, duration = load_audio(query_path)
+        total_started = perf_counter()
+
+        # Load and fingerprint query (queries are capped for predictable runtime).
+        load_started = perf_counter()
+        y, sr, duration = load_audio(query_path, max_duration=max_duration)
+        load_ms = (perf_counter() - load_started) * 1000
+
+        spectrogram_started = perf_counter()
         S_db, freqs, times = compute_spectrogram(y, sr)
+        spectrogram_ms = (perf_counter() - spectrogram_started) * 1000
+
+        constellation_started = perf_counter()
         peaks, _ = extract_peaks(S_db, freqs, times,
                                  neighborhood=PEAK_NEIGHBORHOOD,
                                  amp_min=PEAK_AMP_MIN)
+        constellation_ms = (perf_counter() - constellation_started) * 1000
         
         if len(peaks) < 5:
+            total_ms = (perf_counter() - total_started) * 1000
             return {
                 'matched_song': None,
                 'confidence': 0,
                 'reason': 'Not enough peaks detected in query',
                 'offsets': np.array([]),
+                'song_scores': {song: 0 for song in self.song_list},
                 'query_hashes': [],
                 'peaks': peaks,
-                'S_db': S_db
+                'S_db': S_db,
+                'freqs': freqs,
+                'times': times,
+                'duration': duration,
+                'total_hash_matches': 0,
+                'use_single_peaks': use_single_peaks,
+                'timings': {
+                    'audio_load_ms': load_ms,
+                    'spectrogram_ms': spectrogram_ms,
+                    'constellation_ms': constellation_ms,
+                    'hash_generation_ms': 0.0,
+                    'database_lookup_ms': 0.0,
+                    'scoring_ms': 0.0,
+                    'total_ms': total_ms,
+                },
             }
         
         # Create hashes from query
+        hash_started = perf_counter()
         if use_single_peaks:
-            query_hashes, _ = create_single_peak_hashes(peaks)
+            query_hashes, query_hash_data = create_single_peak_hashes(peaks)
             db_to_search = self.single_peak_db
         else:
-            query_hashes, _ = create_hashes(peaks)
+            query_hashes, query_hash_data = create_hashes(peaks)
             db_to_search = self.database
+        hash_generation_ms = (perf_counter() - hash_started) * 1000
         
         # Look up hashes in database and collect offsets
         offsets_by_song = {song: [] for song in self.song_list}
         total_matches = 0
         
-        for query_hash in query_hashes:
+        lookup_started = perf_counter()
+        for query_hash, (_, query_time) in zip(query_hashes, query_hash_data):
             if query_hash in db_to_search:
                 database_entries = db_to_search[query_hash]
                 total_matches += len(database_entries)
                 
                 for db_song_name, db_time in database_entries:
-                    # Get the time of this hash in the query
-                    # For single peaks, use the peak time directly
-                    if use_single_peaks:
-                        # Find the corresponding peak
-                        query_peak_idx = query_hashes.index(query_hash)
-                        query_time = peaks[query_peak_idx][1]
-                    else:
-                        query_time = 0  # Will be computed from hash
-                    
-                    # Compute offset: where would this match occur in the original song?
-                    # offset = database_time - query_time (approximately)
-                    offset = db_time
+                    # Genuine matches agree on database_time - query_time.
+                    offset = float(db_time) - float(query_time)
                     offsets_by_song[db_song_name].append(offset)
+        database_lookup_ms = (perf_counter() - lookup_started) * 1000
         
         # Create offset histogram for each song
+        scoring_started = perf_counter()
         song_scores = {}
-        matched_song_offsets = []
         
         for song_name in self.song_list:
             offsets = np.array(offsets_by_song[song_name])
@@ -133,12 +155,9 @@ class SongMatcher:
             if len(offsets) == 0:
                 song_scores[song_name] = 0
             else:
-                # Histogram of offsets: sharp spike = good match
-                hist, bins = np.histogram(offsets, bins=100)
-                song_scores[song_name] = np.max(hist)  # Height of tallest peak
-                
-                if song_name == self.song_list[0]:  # Save first song's offsets for plotting
-                    matched_song_offsets = offsets
+                # Use fixed half-second bins so scores are comparable between songs.
+                aligned_offsets = np.round(offsets / 0.5) * 0.5
+                song_scores[song_name] = Counter(aligned_offsets).most_common(1)[0][1]
         
         # Find best match
         best_song = max(song_scores, key=song_scores.get)
@@ -153,6 +172,13 @@ class SongMatcher:
         else:
             matched_song = best_song
             confidence = best_score
+
+        matched_song_offsets = (
+            np.asarray(offsets_by_song[matched_song], dtype=float)
+            if matched_song else np.array([])
+        )
+        scoring_ms = (perf_counter() - scoring_started) * 1000
+        total_ms = (perf_counter() - total_started) * 1000
         
         return {
     'matched_song': matched_song,
@@ -164,7 +190,18 @@ class SongMatcher:
     'S_db': S_db,
     'freqs': freqs,
     'times': times,
-    'use_single_peaks': use_single_peaks
+    'use_single_peaks': use_single_peaks,
+    'duration': duration,
+    'total_hash_matches': total_matches,
+    'timings': {
+        'audio_load_ms': load_ms,
+        'spectrogram_ms': spectrogram_ms,
+        'constellation_ms': constellation_ms,
+        'hash_generation_ms': hash_generation_ms,
+        'database_lookup_ms': database_lookup_ms,
+        'scoring_ms': scoring_ms,
+        'total_ms': total_ms,
+    }
 }
     
     def plot_offset_histogram(self, query_path, matched_song=None):
@@ -200,11 +237,11 @@ class SongMatcher:
         
         # Collect offsets for the specified song
         offsets = []
-        for query_hash in query_hashes:
+        for query_hash, (_, query_time) in zip(query_hashes, query_hash_data):
             if query_hash in self.database:
                 for db_song, db_time in self.database[query_hash]:
                     if matched_song is None or db_song == matched_song:
-                        offsets.append(db_time)
+                        offsets.append(float(db_time) - float(query_time))
         
         # Plot histogram
         fig, ax = plt.subplots(figsize=(12, 5))
